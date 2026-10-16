@@ -3,3 +3,4 @@ pypdf
 sentence-transformers
 chromadb
 google-genai
+pymupdf

@@ -1,14 +1,21 @@
 import streamlit as st
-from pdf_utils import extract_pages
+from pdf_utils import extract_pages, save_pdf, delete_pdf, render_page
 from chunking import chunk_pages
 from vectorstore import load_model, index_chunks, search, list_courses, delete_course
 from llm import ask_llm, rewrite_question
+
+st.set_page_config(page_title="Assistant de cours", layout="wide")
 
 
 @st.cache_resource
 def get_model():
     return load_model()
 
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "selected" not in st.session_state:
+    st.session_state.selected = None  
 
 st.title("Assistant de cours")
 
@@ -23,11 +30,11 @@ if uploaded is not None:
     if st.button("Indexer ce cours"):
         with st.spinner("Calcul des embeddings..."):
             model = get_model()
+            save_pdf(uploaded)  
             total, dim = index_chunks(chunks, model, uploaded.name)
         st.success(f"Cours ajouté. La base contient maintenant {total} passages.")
 
 st.divider()
-
 
 courses = list_courses()
 
@@ -39,6 +46,8 @@ for name, count in courses.items():
     col1.write(f"{name} ({count} passages)")
     if col2.button("🗑", key=f"del_{name}", help=f"Supprimer {name}"):
         delete_course(name)
+        delete_pdf(name)
+        st.session_state.selected = None
         st.rerun()
 
 choice = st.sidebar.selectbox("Chercher dans", ["Tous les cours"] + list(courses))
@@ -50,86 +59,132 @@ max_distance = st.sidebar.slider(
 )
 if st.sidebar.button("Nouvelle conversation"):
     st.session_state.messages = []
-
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+    st.session_state.selected = None
 
 
-def show_assistant(content, note=None, sources=None):
-    st.markdown(content)
-    if note:
-        st.caption(note)
-    if sources:
-        with st.expander("Passages examinés"):
-            for s in sources:
-                st.markdown(
-                    f"**{s.get('source', '')} - page {s['page']}** "
-                    f"(distance {s['distance']:.3f}) {s['statut']}"
-                )
-                st.text(s["text"])
-
-
-for m in st.session_state.messages:
+def render_message(i, m):
+    """Affiche un message, avec les boutons de citation pour l'assistant."""
     with st.chat_message(m["role"]):
-        if m["role"] == "user":
-            st.markdown(m["content"])
-        else:
-            show_assistant(m["content"], m.get("note"), m.get("sources"))
+        st.markdown(m["content"])
+        if m["role"] != "assistant":
+            return
+        if m.get("note"):
+            st.caption(m["note"])
+        seen = set()
+        for j, s in enumerate(m.get("sources", [])):
+            key = (s["source"], s["page"])
+            if not s.get("retenu") or key in seen:
+                continue
+            seen.add(key)
+            if st.button(f"{s['source']} · page {s['page']}", key=f"cite_{i}_{j}"):
+                st.session_state.selected = {
+                    "msg": i, "source": s["source"], "page": s["page"]
+                }
 
+
+
+col_chat, col_panel = st.columns([3, 2], gap="large")
 question = st.chat_input("Pose ta question sur tes cours")
 
-if question and not courses:
-    st.info("Indexe d'abord un cours avant de poser une question.")
-elif question:
-    history = [m for m in st.session_state.messages if not m.get("failed")]
+with col_chat:
+    for i, m in enumerate(st.session_state.messages):
+        render_message(i, m)
 
-    with st.chat_message("user"):
-        st.markdown(question)
+    if question and not courses:
+        st.info("Indexe d'abord un cours avant de poser une question.")
+    elif question:
+        
+        history = [m for m in st.session_state.messages if not m.get("failed")]
 
-    try:
-        with st.spinner("Recherche et réponse..."):
-            standalone = rewrite_question(question, history)
-            model = get_model()
-            hits = search(standalone, model, k=3, source=source)
+        with st.chat_message("user"):
+            st.markdown(question)
 
-            if standalone != question:
-                best = {(h["source"], h["page"], h["text"]): h for h in hits}
-                for h in search(question, model, k=3, source=source):
-                    key = (h["source"], h["page"], h["text"])
-                    if key not in best or h["distance"] < best[key]["distance"]:
-                        best[key] = h
-                hits = sorted(best.values(), key=lambda h: h["distance"])[:3]
+        try:
+            with st.spinner("Recherche et réponse..."):
+                standalone = rewrite_question(question, history)
+                model = get_model()
+                hits = search(standalone, model, k=3, source=source)
 
-            relevant = [h for h in hits if h["distance"] <= max_distance]
+         
+                if standalone != question:
+                    best = {(h["source"], h["page"], h["text"]): h for h in hits}
+                    for h in search(question, model, k=3, source=source):
+                        key = (h["source"], h["page"], h["text"])
+                        if key not in best or h["distance"] < best[key]["distance"]:
+                            best[key] = h
+                    hits = sorted(best.values(), key=lambda h: h["distance"])[:3]
 
-            if relevant:
-                answer = ask_llm(question, relevant, history)
+                relevant = [h for h in hits if h["distance"] <= max_distance]
+
+                if relevant:
+                    answer = ask_llm(question, relevant, history)
+                else:
+                    answer = "Je ne trouve pas la réponse dans le cours."
+            ok = True
+        except Exception as e:
+            ok = False
+            st.warning("Gemini est indisponible pour le moment. Réessaie dans un instant.")
+            st.caption(f"Détail technique : {type(e).__name__}")
+
+        if ok:
+            note = f"Question reformulée : {standalone}" if standalone != question else None
+            sources = [
+                {
+                    "source": h["source"],
+                    "page": h["page"],
+                    "distance": h["distance"],
+                    "text": h["text"],
+                    "retenu": h["distance"] <= max_distance,
+                }
+                for h in hits
+            ]
+            failed = not relevant
+
+            st.session_state.messages.append(
+                {"role": "user", "content": question, "failed": failed}
+            )
+            st.session_state.messages.append(
+                {"role": "assistant", "content": answer, "note": note,
+                 "sources": sources, "failed": failed}
+            )
+            idx = len(st.session_state.messages) - 1
+
+            cited = [s for s in sources if s["retenu"]]
+            st.session_state.selected = {
+                "msg": idx,
+                "source": cited[0]["source"] if cited else None,
+                "page": cited[0]["page"] if cited else None,
+            }
+            render_message(idx, st.session_state.messages[idx])
+
+with col_panel:
+    sel = st.session_state.selected
+    if not sel:
+        st.info("Pose une question : la page du cours citée s'affichera ici.")
+    else:
+        tab_cite, tab_pass = st.tabs(["Citation", "Passages examinés"])
+
+        with tab_cite:
+            if sel["source"]:
+                st.caption(f"{sel['source']} - page {sel['page']}")
+                img = render_page(sel["source"], sel["page"])
+                if img:
+                    st.image(img)
+                else:
+                    st.warning(
+                        "PDF introuvable. Réindexe ce cours (bouton « Indexer ce cours ») "
+                        "pour pouvoir afficher ses pages."
+                    )
             else:
-                answer = "Je ne trouve pas la réponse dans le cours."
-    except Exception as e:
-        st.warning("Gemini est indisponible pour le moment. Réessaie dans un instant.")
-        st.caption(f"Détail technique : {type(e).__name__}")
-        st.stop()
+                st.info("Aucun passage assez proche : pas de citation.")
 
-    note = f"Question reformulée : {standalone}" if standalone != question else None
-    sources = [
-        {
-            "source": h["source"],
-            "page": h["page"],
-            "distance": h["distance"],
-            "text": h["text"],
-            "statut": "retenu" if h["distance"] <= max_distance else "ignoré",
-        }
-        for h in hits
-    ]
-
-    with st.chat_message("assistant"):
-        show_assistant(answer, note, sources)
-
-    failed = not relevant
-    st.session_state.messages.append(
-        {"role": "user", "content": question, "failed": failed}
-    )
-    st.session_state.messages.append(
-        {"role": "assistant", "content": answer, "note": note, "sources": sources, "failed": failed}
-    )
+        with tab_pass:
+            msgs = st.session_state.messages
+            if sel["msg"] < len(msgs):
+                for s in msgs[sel["msg"]].get("sources", []):
+                    statut = "retenu" if s.get("retenu") else " ignoré"
+                    st.markdown(
+                        f"**{s['source']} - page {s['page']}** "
+                        f"(distance {s['distance']:.3f}) {statut}"
+                    )
+                    st.text(s["text"])
